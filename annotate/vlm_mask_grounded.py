@@ -1494,6 +1494,7 @@ def scan_frames_for_objects(
         )
         mask, metadata = segmenter.segment(
             frame_path, object_prompts, threshold,
+            min_threshold=threshold,
             max_instances=max_instances,
             iou_threshold=iou_threshold,
             crop_bbox=crop_bbox,
@@ -1538,7 +1539,7 @@ def scan_frames_for_objects(
             object_prompts,
             threshold,
             retry_with_variations=True,
-            min_threshold=0.1,
+            min_threshold=threshold,
             max_instances=max_instances,
             iou_threshold=iou_threshold,
             crop_bbox=crop_bbox,
@@ -1781,7 +1782,7 @@ Examples:
                         [obj],
                         threshold=args.threshold,
                         retry_with_variations=True,
-                        min_threshold=0.1,
+                        min_threshold=args.threshold,
                         max_instances=args.max_instances,
                         iou_threshold=args.iou_threshold,
                         crop_bbox=bbox,
@@ -1810,7 +1811,7 @@ Examples:
                     selected_objects,
                     threshold=args.threshold,
                     retry_with_variations=True,
-                    min_threshold=0.1,
+                    min_threshold=args.threshold,
                     max_instances=args.max_instances,
                     iou_threshold=args.iou_threshold,
                 )

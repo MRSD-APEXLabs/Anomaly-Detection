@@ -30,6 +30,14 @@ from pycocotools import mask as MaskUtils
 sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(__file__))))  # add proj dir to path
 from utils import rle_to_bmask, apply_anno, generate_rand_colors, load_yaml_file, strip_instance_name
 
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))  # TubeletGraph/
+from spatiotemporal_attention import (
+    load_all_video_bboxes, build_spatiotemporal_graph,
+    get_attention_bbox, draw_bbox_annotation, describe_relation,
+    choose_zoom_mode, get_attention_bboxes_for_siblings, draw_sibling_comparison,
+    apply_consensus_filter,
+)
+
 
 # =============================================================================
 # Unified VLM call wrapper
@@ -400,14 +408,57 @@ Answer: yes or no"""),
 # Image Processing Utilities
 # =============================================================================
 
+def get_attention_image(image, graph, obj_idx, frame_idx, color_rgb, mode="zoom_in",
+                         mask_fallback=None):
+    """
+    Bounding-box-based substitute for get_masked_image(), driven by the
+    spatiotemporal tubelet graph.
+
+    Uses a temporally-smoothed bounding box (stable across frames, unlike a
+    raw per-frame pixel mask contour) as the attention region.
+      mode="zoom_in":          this object's own box only.
+      mode="zoom_out":         unions in every graph neighbor's box too, so
+                                the VLM sees a manipulator together with what
+                                it's manipulating (right for a 1-2 neighbor
+                                actuator/workpiece pair).
+      mode="zoom_out_siblings": draws every neighbor's own box SEPARATELY
+                                (not merged) alongside this object's own box,
+                                emphasized -- right for a rigid cluster of
+                                many similar parts (e.g. all tips of one
+                                multi-channel tool), where a merged box would
+                                destroy the sibling-to-sibling comparison
+                                that's needed to spot a single outlier.
+
+    Falls back to the old pixel-mask contour (`mask_fallback`, an RLE/bool
+    mask) if the graph has no box for this object/frame -- e.g. a track that
+    only exists in one frame and was never smoothed.
+    """
+    h, w = image.shape[:2]
+
+    if graph is not None and mode == "zoom_out_siblings":
+        result = get_attention_bboxes_for_siblings(graph, obj_idx, frame_idx)
+        if result is not None:
+            own_bbox, sibling_bboxes = result
+            return draw_sibling_comparison(image, own_bbox, sibling_bboxes, color_rgb)
+
+    bbox = None
+    if graph is not None:
+        bbox = get_attention_bbox(graph, obj_idx, frame_idx, mode=mode, img_w=w, img_h=h)
+    if bbox is not None:
+        return draw_bbox_annotation(image, bbox, color_rgb, thickness=3)
+    if mask_fallback is not None:
+        return get_masked_image(image, mask_fallback, color_rgb)
+    return image.copy()
+
+
 def get_masked_image(image, mask, color_rgb, mask_alpha=0.0, contour_thickness=3):
     """Apply colored contour to image around mask region."""
     if isinstance(mask, dict):
         mask = rle_to_bmask(mask)
     masked_image = apply_anno(
-        image.copy(), 
-        mask=mask, 
-        mask_color=color_rgb, 
+        image.copy(),
+        mask=mask,
+        mask_color=color_rgb,
         mask_alpha=mask_alpha, 
         contour_thickness=contour_thickness
     )
@@ -461,51 +512,79 @@ def detect_state_changes(
     prompts: dict,
     temperature: float = 0.0,
     sample_interval: int = 10,
+    graph=None,
+    graph_obj_id: str = None,
 ) -> list:
     """
     Detect state changes in a tracked object across video frames.
+
+    When `graph` (a SpatioTemporalGraph over this video's tracked objects) is
+    supplied, the two comparison frames use a temporally-smoothed bounding
+    box instead of the raw per-frame pixel mask -- this is what keeps SAM2's
+    frame-to-frame mask jitter from being misread as physical deformation.
+    If the object has graph neighbors (e.g. a manipulator moving with the
+    part it's holding), the crop zooms out to include them, and the prompt
+    is given an explicit note about the relationship.
     """
     state_changes = []
     predictions = pred_data.get('prediction', {})
-    
+
     frame_indices = sorted([int(k) for k in predictions.keys()])
-    
+
     if len(frame_indices) < 2:
         return state_changes
-    
+
     # Sample frames for analysis
     sample_frames = [frame_indices[0]]
     for i in range(sample_interval, len(frame_indices), sample_interval):
         sample_frames.append(frame_indices[i])
     if frame_indices[-1] not in sample_frames:
         sample_frames.append(frame_indices[-1])
-    
-    
+
+
     print(f"  Analyzing {len(sample_frames)} frames for state changes...")
-    
+
+    zoom_mode = choose_zoom_mode(graph, graph_obj_id) if (graph and graph_obj_id) else "zoom_in"
+    relation_note = ""
+    if zoom_mode != "zoom_in":
+        relation_note = "\n\n[TRACKING CONTEXT: " + describe_relation(graph, graph_obj_id) + "]"
+
     # Compare consecutive sampled frames
     for i in range(len(sample_frames) - 1):
         frame_idx_before = sample_frames[i]
         frame_idx_after = sample_frames[i + 1]
-        
+
         # Get masks
         mask_before = predictions.get(str(frame_idx_before), {}).get(obj_idx)
         mask_after = predictions.get(str(frame_idx_after), {}).get(obj_idx)
-        
+
         if mask_before is None or mask_after is None:
             continue
-        
+
         # Load frames
         img_before = imageio.imread(frame_paths[frame_idx_before])
         img_after = imageio.imread(frame_paths[frame_idx_after])
-        
-        # Create masked images
-        img_before_masked = get_masked_image(img_before, mask_before, init_color)
-        img_after_masked = get_masked_image(img_after, mask_after, init_color)
-        
+
+        # Create attention-region images: bounding box (from the spatiotemporal
+        # graph) in preference to the raw pixel mask, which falls back
+        # automatically if this object/frame isn't in the graph.
+        if graph is not None and graph_obj_id is not None:
+            img_before_masked = get_attention_image(
+                img_before, graph, graph_obj_id, frame_idx_before, init_color,
+                mode=zoom_mode, mask_fallback=mask_before)
+            img_after_masked = get_attention_image(
+                img_after, graph, graph_obj_id, frame_idx_after, init_color,
+                mode=zoom_mode, mask_fallback=mask_after)
+        else:
+            img_before_masked = get_masked_image(img_before, mask_before, init_color)
+            img_after_masked = get_masked_image(img_after, mask_after, init_color)
+
         # Query VLM for state change
+        state_change_prompt = prompts['state_change'][0]
+        if relation_note:
+            state_change_prompt = ('text', state_change_prompt[1] + relation_note)
         content_data = [
-            prompts['state_change'][0],
+            state_change_prompt,
             ('image', img_before_masked),
             ('image', img_after_masked),
         ]
@@ -696,6 +775,20 @@ if __name__ == "__main__":
 
     instance_names = [x.removesuffix('.json') for x in os.listdir(pred_track_dir) if x.endswith('.json')]
 
+    # Build the spatiotemporal graph once for every tracked object in this
+    # video, before captioning any of them -- this is what lets a single
+    # object's state-change call know about its graph neighbors (see
+    # detect_state_changes / get_attention_image above).
+    try:
+        _all_bboxes = load_all_video_bboxes(pred_track_dir, instance_names)
+        video_graph = build_spatiotemporal_graph(_all_bboxes)
+        _n_edges = sum(len(v) for v in video_graph.edges.values()) // 2
+        print(f"[spatiotemporal graph] {len(_all_bboxes)} tracked objects, {_n_edges} edges")
+    except Exception as e:
+        print(f"[spatiotemporal graph] WARNING: failed to build ({e}); "
+              f"falling back to per-object pixel masks with no cross-object context.")
+        video_graph = None
+
     for instance_name in tqdm(instance_names, desc="Processing instances"):
         new_pred_path = osp.join(out_dir, f'{instance_name}.json')
 
@@ -769,7 +862,12 @@ if __name__ == "__main__":
         # =====================================================================
         if not args.skip_state_change:
             
-            # Analyze state changes for the main tracked object
+            # Analyze state changes for the main tracked object.
+            # graph_obj_id is the global suffix ('2', '5', '6', ...) this
+            # instance_name was tracked under -- that's the graph's node id,
+            # distinct from prompt_obj_idx which is always '0' inside this
+            # object's own per-object prediction file.
+            graph_obj_id = instance_name.rsplit('_', 1)[-1]
             state_changes = detect_state_changes(
                 client, model_name,
                 frame_paths, pred_data,
@@ -777,6 +875,7 @@ if __name__ == "__main__":
                 init_color, init_c_name,
                 prompts,
                 args.temp, args.sample_interval,
+                graph=video_graph, graph_obj_id=graph_obj_id,
             )
             
             if state_changes:
@@ -918,6 +1017,48 @@ if __name__ == "__main__":
         print(f"Saved: {new_pred_path}")
         print(f"  Objects: {list(obj_info.keys())}")
         print(f"  State changes: {len(state_change_events)}")
+
+    # =========================================================================
+    # Post-pass: consensus filter across the whole video's sibling clusters.
+    # Must run after every instance is captioned (not per-object, inline
+    # above) because it needs to see all objects' claims at once to tell
+    # "one real outlier" apart from "the whole rigid cluster reported a
+    # difference at the same moment" (almost always shared motion blur).
+    # =========================================================================
+    if video_graph is not None:
+        events_by_obj = {}
+        for instance_name in instance_names:
+            path = osp.join(out_dir, f'{instance_name}.json')
+            if not osp.exists(path):
+                continue
+            with open(path, 'r') as f:
+                pred_data = json.load(f)
+            graph_obj_id = instance_name.rsplit('_', 1)[-1]
+            events_by_obj[graph_obj_id] = pred_data.get('state_change_events', [])
+
+        filtered_by_obj = apply_consensus_filter(events_by_obj, video_graph)
+
+        n_downgraded = 0
+        for instance_name in instance_names:
+            path = osp.join(out_dir, f'{instance_name}.json')
+            if not osp.exists(path):
+                continue
+            graph_obj_id = instance_name.rsplit('_', 1)[-1]
+            new_events = filtered_by_obj.get(graph_obj_id)
+            if new_events is None or new_events == events_by_obj.get(graph_obj_id):
+                continue
+
+            with open(path, 'r') as f:
+                pred_data = json.load(f)
+            pred_data['state_change_events'] = new_events
+            for obj_key in pred_data.get('obj_info', {}):
+                pred_data['obj_info'][obj_key]['state_changes'] = new_events
+            with open(path, 'w') as f:
+                json.dump(pred_data, f)
+            n_downgraded += 1
+
+        print(f"[consensus filter] re-examined {len(events_by_obj)} objects' claims, "
+              f"rewrote {n_downgraded} instance file(s) with shared-artifact claims downgraded")
 
 
         
