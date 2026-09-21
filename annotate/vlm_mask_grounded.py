@@ -741,7 +741,11 @@ class SAM3Segmenter:
             from sam3.model.sam3_image_processor import Sam3Processor
             
             self._model = build_sam3_image_model()
-            self._processor = Sam3Processor(self._model)
+            # confidence_threshold=0.0: Sam3Processor otherwise defaults to 0.5
+            # and drops every candidate below that internally, before this
+            # module's own --threshold/min_threshold filtering ever runs --
+            # silently making --threshold a no-op for anything under 0.5.
+            self._processor = Sam3Processor(self._model, confidence_threshold=0.0)
             print("✓ SAM3 loaded successfully")
         except ImportError:
             raise RuntimeError(
@@ -1690,17 +1694,16 @@ Examples:
         
         # Step 2: Detect objects with VLM
         detector = VLMObjectDetector(args.vlm)
-        # objects = detector.detect_objects(first_frame_path)
-            
-        # if not objects:
-        #     print("\nNo objects detected in the image.")
-        #     sys.exit(1)
-        
-        # print(f"\n✓ Detected {len(objects)} objects:")
-        # for i, obj in enumerate(objects, 1):
-        #     print(f"  {i}. {obj}")
-        objects = ["single-channel pipette"]
-        
+        objects = detector.detect_objects(first_frame_path)
+
+        if not objects:
+            print("\nNo objects detected in the image.")
+            sys.exit(1)
+
+        print(f"\n✓ Detected {len(objects)} objects:")
+        for i, obj in enumerate(objects, 1):
+            print(f"  {i}. {obj}")
+
         # Step 3: Select objects to segment
         if args.auto:
             selected_objects = objects
