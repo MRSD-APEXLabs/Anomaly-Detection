@@ -71,12 +71,41 @@ def add_mask(sam2, obj_id, mask, all_tracks, tracked_objs, frame_idx):
     all_tracks[frame_idx][obj_id] = bmask_to_rle(mask)
     tracked_objs[obj_id] = {'mask': mask, 'init_frame_idx': frame_idx}
 
-def find_entity_to_add(all_tracks, entity, start_frame, fill_coverage_thrd, pix_perc_thrd):
-    """ 
+def compute_roi_mask(prompt_masks, margin_frac, vertical_extend):
+    """ Rectangle around the union of the prompt masks, padded by margin_frac of the
+    image size on each side. With vertical_extend it spans the full image height, so
+    it still covers a tool that travels vertically away from its prompt-frame position.
+    """
+    merged = MaskUtils.merge(list(prompt_masks), intersect=0)
+    img_h, img_w = merged['size']
+    x, y, bw, bh = MaskUtils.toBbox(merged)
+    pad_x, pad_y = margin_frac * img_w, margin_frac * img_h
+    x0, x1 = max(0, int(x - pad_x)), min(img_w, int(np.ceil(x + bw + pad_x)))
+    if vertical_extend:
+        y0, y1 = 0, img_h
+    else:
+        y0, y1 = max(0, int(y - pad_y)), min(img_h, int(np.ceil(y + bh + pad_y)))
+    roi = np.zeros((img_h, img_w), dtype=bool)
+    roi[y0:y1, x0:x1] = True
+    print(f'ROI filter: x[{x0}:{x1}] y[{y0}:{y1}] of {img_w}x{img_h}')
+    return bmask_to_rle(roi)
+
+def in_roi(mask_rle, roi):
+    """ True if no ROI is set, or the mask lies mostly inside it. """
+    if roi is None:
+        return True
+    roi_mask, min_overlap = roi
+    return coverage(den_mask=mask_rle, mask2intersect=roi_mask) >= min_overlap
+
+def find_entity_to_add(all_tracks, entity, start_frame, fill_coverage_thrd, pix_perc_thrd, roi=None):
+    """
     fill_coverage_thrd: For any new entity mask to add, the existing tracks must cover it < fill_coverage_thrd
     pix_perc_thrd: pixel percentage threshold for adding new object
-    """    
+    roi: optional (roi_mask_rle, min_overlap); entities mostly outside it are never added
+    """
     entity_masks_rle = entity[str(start_frame)]
+    if roi is not None:
+        entity_masks_rle = {k: v for k, v in entity_masks_rle.items() if in_roi(v, roi)}
     if len(entity_masks_rle) == 0:
         return []   # No super pixels found, skipped
 
@@ -92,7 +121,10 @@ def find_entity_to_add(all_tracks, entity, start_frame, fill_coverage_thrd, pix_
     entity_to_add = np.where(np.logical_and(coverages < fill_coverage_thrd, pix_perc > pix_perc_thrd))[0]
     if len(entity_to_add) > 0:
         print('One side IOU:', ' '.join([f'{x:.2f}' for x in coverages[entity_to_add]]), '#Pixel(%):', ' '.join([f'{x:.2f}' for x in 100*pix_perc[entity_to_add]]))
-    return entity_to_add
+    # Return entity keys, not positions: once the ROI filter drops entries, position i
+    # no longer equals key str(i), and the caller looks entities up by key.
+    entity_keys = list(entity_masks_rle.keys())
+    return [int(entity_keys[i]) for i in entity_to_add]
 
 def setup(sam2, instance_name, vid_dir, entity_dir):
     entity_path = osp.join(entity_dir, instance_name+'.json')
@@ -104,36 +136,42 @@ def setup(sam2, instance_name, vid_dir, entity_dir):
     assert num_frames == len(entity.keys())
     return entity, num_frames, sam2
 
-def compute_save_init_tubes(cfg, instance_name, save_path, mask_frame_id, max_obj_num=150):
+def compute_save_init_tubes(cfg, instance_name, save_path, mask_frame_id, max_obj_num=150, roi=None):
     """ Compute and save initial tracks from super pixels """
     if osp.exists(save_path):
         return
     sam2 = get_tracker(cfg.tracker)
-    entity, num_frames, sam2 = setup(sam2, instance_name, cfg.data.image_dir, cfg.entity_dir)        
-    
+    entity, num_frames, sam2 = setup(sam2, instance_name, cfg.data.image_dir, cfg.entity_dir)
+
     init_entity = entity[str(mask_frame_id)]
     tracked_objs = dict()
     all_tracks = {k: dict() for k in range(num_frames)}
     num_it = len(init_entity.items()) // max_obj_num + 1
     pix_thrd = entity[str(mask_frame_id)]['0']['size'][0] * entity[str(mask_frame_id)]['0']['size'][1] * cfg.init_entity_thrd
-    
+
+    def keep(mask_rle):
+        return MaskUtils.area(mask_rle) >= pix_thrd and in_roi(mask_rle, roi)
+
+    if roi is not None:
+        n_kept = sum(keep(m) for m in init_entity.values())
+        print(f'ROI filter: tracking {n_kept} of {len(init_entity)} initial entities')
+
     for it in range(num_it):
         sam2.predictor.reset_state(sam2.inference_state)
         start = it * max_obj_num
         end = min(start+max_obj_num, len(init_entity.items()))
         for mask_idx, mask_rle in list(init_entity.items())[start:end]:
-            if MaskUtils.area(mask_rle) < pix_thrd:
-                print(f'Mask {mask_idx} is too small, skipped')
+            if not keep(mask_rle):
                 continue
             add_mask(sam2, int(mask_idx), rle_to_bmask(mask_rle), all_tracks, tracked_objs, frame_idx=mask_frame_id)
-            
+
         # Track forwards
         propagate(sam2, all_tracks, start_frame=mask_frame_id, reverse=False)
         # Track backwards if not starting at frame 0
         if mask_frame_id > 0:
             sam2.predictor.reset_state(sam2.inference_state)
             for mask_idx, mask_rle in list(init_entity.items())[start:end]:
-                if MaskUtils.area(mask_rle) < pix_thrd:
+                if not keep(mask_rle):
                     continue
                 add_mask(sam2, int(mask_idx), rle_to_bmask(mask_rle), all_tracks, tracked_objs, frame_idx=mask_frame_id)
 
@@ -212,7 +250,7 @@ def compute_pred(cfg, prompt_mask, instance_name, precomp_mm_path, mask_frame_id
     sam2_mm.clear_all_cache()
     torch.cuda.empty_cache()
 
-def compute_save_all_tubes(cfg, sam2, dataset_name, entity, all_tracks, tracked_objs, prompt_mask, final_all_tracks_path, mask_frame_id):
+def compute_save_all_tubes(cfg, sam2, dataset_name, entity, all_tracks, tracked_objs, prompt_mask, final_all_tracks_path, mask_frame_id, roi=None):
     # Load precomputed tracks
     nothing_in_init = len(tracked_objs) == 0
     prompt_obj_id = max([int(x) for x in tracked_objs.keys()]) + 1 if not nothing_in_init else 1
@@ -258,7 +296,7 @@ def compute_save_all_tubes(cfg, sam2, dataset_name, entity, all_tracks, tracked_
         for start_frame in range(scan_start, scan_end):
             sam2.predictor.reset_state(sam2.inference_state)
 
-            entity_to_add = find_entity_to_add(all_tracks, entity, start_frame, cfg.fill_coverage_thrd, cfg.fill_entity_thrd)
+            entity_to_add = find_entity_to_add(all_tracks, entity, start_frame, cfg.fill_coverage_thrd, cfg.fill_entity_thrd, roi=roi)
             if len(entity_to_add) == 0:
                 continue
 
@@ -318,6 +356,7 @@ def make_config(args, cfg, verbose=True):
         fill_coverage_thrd = tb_cfg.fill_coverage_thrd,
         rm_init_entity_thrd = tb_cfg.rm_init_entity_thrd,
         collect_spacing = int(tb_cfg.collect_spacing),
+        roi_filter = tb_cfg.get('roi_filter', None),
         prox_tracker = tb_cfg.prox_tracker,
         paths = cfg.paths,
         data = getattr(cfg.datasets, args.dataset),
@@ -370,15 +409,26 @@ if __name__ == "__main__":
         print('=' * 20)
         print(f"Processing ({instance_idx}/{len(instance_names)}) {instance_name}...")
         
-        ### Step 1: Process all tracks from every super pixel in the initial frame, disregarding the mask prompt
-        init_all_tracks_path = osp.join(init_save_dir, '{}.json'.format(instance_name))
-        compute_save_init_tubes(cfg, instance_name, init_all_tracks_path, args.mask_frame_id)
-
-        ### Step 2: Process and save all tracks per each prompt object
         init_prompt_path = sorted(glob.glob(
             osp.join(cfg.data.anno_dir, instance_name, cfg.data.anno_format)
         ))[0]
         prompt_objs = load_anno(init_prompt_path)  # dict('1': rle, ...)
+
+        # Optionally restrict entity tracking to a region around the prompt objects
+        roi = None
+        if cfg.roi_filter is not None and cfg.roi_filter.get('enabled', False):
+            roi_mask = compute_roi_mask(
+                prompt_objs.values(),
+                margin_frac=float(cfg.roi_filter.get('margin_frac', 0.1)),
+                vertical_extend=bool(cfg.roi_filter.get('vertical_extend', True)),
+            )
+            roi = (roi_mask, float(cfg.roi_filter.get('min_overlap', 0.5)))
+
+        ### Step 1: Process all tracks from every super pixel in the initial frame, disregarding the mask prompt
+        init_all_tracks_path = osp.join(init_save_dir, '{}.json'.format(instance_name))
+        compute_save_init_tubes(cfg, instance_name, init_all_tracks_path, args.mask_frame_id, roi=roi)
+
+        ### Step 2: Process and save all tracks per each prompt object
         for obj_idx, prompt_mask in prompt_objs.items():
             ## Process and all new tracks, using the mask prompt
             final_all_tracks_path = osp.join(final_save_dir, f'{instance_name}_{obj_idx}.json')
@@ -400,7 +450,7 @@ if __name__ == "__main__":
                 tracked_objs = {int(k): v for k, v in data['tracked_objs'].items()}
             resolve_init_entity_prompt_conflicts(cfg, sam2, all_tracks, tracked_objs, prompt_mask, args.mask_frame_id)
 
-            compute_save_all_tubes(cfg, sam2, args.dataset, entity, all_tracks, tracked_objs, prompt_mask, final_all_tracks_path, args.mask_frame_id)
+            compute_save_all_tubes(cfg, sam2, args.dataset, entity, all_tracks, tracked_objs, prompt_mask, final_all_tracks_path, args.mask_frame_id, roi=roi)
             
             ## clear cache after processing
             sam2.clear_all_cache()
