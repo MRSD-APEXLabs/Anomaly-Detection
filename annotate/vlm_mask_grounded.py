@@ -1624,6 +1624,14 @@ Examples:
     parser.add_argument("--bbox_object_desc", type=str, default=None,
                        help="Object class to localise before cropping (e.g. "
                             "'multi-channel pipette'). Omit to segment the full frame.")
+    parser.add_argument("--object_filter", type=str, default=None,
+                       help="Comma-separated substrings; only keep auto-detected "
+                            "objects whose description contains one of them "
+                            "(case-insensitive). Only used with --auto.")
+    parser.add_argument("--objects", type=str, default=None,
+                       help="Comma-separated text prompts to segment, used instead of the "
+                            "VLM's own object list (e.g. 'pipetting device'). Gives stable "
+                            "grounding when the VLM's free-form names vary between runs.")
     parser.add_argument("--vlm", "-v", default="openai",
                        choices=["openai", "qwen"],
                        help="Vision-Language Model to use")
@@ -1694,7 +1702,11 @@ Examples:
         
         # Step 2: Detect objects with VLM
         detector = VLMObjectDetector(args.vlm)
-        objects = detector.detect_objects(first_frame_path)
+        if args.objects:
+            objects = [o.strip() for o in args.objects.split(",") if o.strip()]
+            print(f"\nUsing given object prompts (VLM detection skipped): {objects}")
+        else:
+            objects = detector.detect_objects(first_frame_path)
 
         if not objects:
             print("\nNo objects detected in the image.")
@@ -1703,6 +1715,17 @@ Examples:
         print(f"\n✓ Detected {len(objects)} objects:")
         for i, obj in enumerate(objects, 1):
             print(f"  {i}. {obj}")
+
+        if args.object_filter:
+            terms = [t.strip().lower() for t in args.object_filter.split(",") if t.strip()]
+            filtered = [o for o in objects if any(t in o.lower() for t in terms)]
+            if filtered:
+                objects = filtered
+                print(f"  Filtered to {len(objects)} object(s) matching {terms}:")
+                for obj in objects:
+                    print(f"    - {obj}")
+            else:
+                print(f"  [Warning] --object_filter {terms} matched nothing; keeping all detected objects.")
 
         # Step 3: Select objects to segment
         if args.auto:
