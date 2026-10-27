@@ -99,6 +99,7 @@ class StateChange:
     description: str
     severity: str = "slight"  # none, slight, moderate, severe
     confidence: float = 0.8
+    tip_contents: Optional[str] = None  # colored liquid / empty / not visible
 
 
 @dataclass
@@ -560,6 +561,21 @@ as normal reference should be excluded.
 state, then the different ones should be abnormal.
 4. Should NOT about the inconsistency between caption and frames to be analyzed.
 5. Should NOT about repetitive operation since it is normal for quality check.
+6. For pipetting steps (a pipette tip entering a tube that holds brown or
+otherwise colored liquid), judge success by the pipette tip's contents
+AFTER it moves up out of the tube, weighing ALL tip readings (tip_contents)
+from that period together rather than any single one:
+- If brown/colored liquid is seen in the tip after it leaves the tube, the
+  aspiration succeeded. This is NOT an anomaly, regardless of how the
+  individual state-change events are labeled. A single reading that
+  disagrees with several others from the same period is most likely a
+  misread and must not override them.
+- Only if the tip is seen empty after it leaves the tube, and never with
+  liquid in that period, did the pipette fail to draw up liquid. Report this
+  as an anomaly (likely a clogged tip), even though no damage, deformation,
+  or leakage is reported.
+- A tip reported as "not visible" gives no evidence either way; it is not
+  the same as an empty tip.
 
 VIDEO CAPTION (from video sampled frames):
 {caption}
@@ -670,6 +686,21 @@ as normal reference should be excluded.
 state, then the different ones should be abnormal.
 4. Should NOT about the inconsistency between caption and frames to be analyzed.
 5. Should NOT about repetitive operation since it is normal for quality check.
+6. For pipetting steps (a pipette tip entering a tube that holds brown or
+otherwise colored liquid), judge success by the pipette tip's contents
+AFTER it moves up out of the tube, weighing ALL tip readings (tip_contents)
+from that period together rather than any single one:
+- If brown/colored liquid is seen in the tip after it leaves the tube, the
+  aspiration succeeded. This is NOT an anomaly, regardless of how the
+  individual state-change events are labeled. A single reading that
+  disagrees with several others from the same period is most likely a
+  misread and must not override them.
+- Only if the tip is seen empty after it leaves the tube, and never with
+  liquid in that period, did the pipette fail to draw up liquid. Report this
+  as an anomaly (likely a clogged tip), even though no damage, deformation,
+  or leakage is reported.
+- A tip reported as "not visible" gives no evidence either way; it is not
+  the same as an empty tip.
 
 VIDEO CAPTION (from video sampled frames):
 {caption}
@@ -913,7 +944,7 @@ def load_prediction(prediction_dir: str, config: Dict) -> Dict:
     for event in pred_data["state_change_events"]:
         obj_idx = event.get("object_idx", "unknown")
         obj_info = pred_data["obj_info"].get(obj_idx, {})
-        pred_data["state_changes"].append({
+        change = {
             "obj_id": obj_idx,
             "obj_name": obj_info.get("desc", "object"),
             "start_frame": event.get("start_frame", 0),
@@ -921,7 +952,10 @@ def load_prediction(prediction_dir: str, config: Dict) -> Dict:
             "change_type": event.get("change_type", "unknown"),
             "description": event.get("description", ""),
             "severity": event.get("severity", "slight"),
-        })
+        }
+        if "tip_contents" in event:
+            change["tip_contents"] = event["tip_contents"]
+        pred_data["state_changes"].append(change)
     
     n_obj = len(pred_data["obj_info"])
     n_events = len(pred_data["state_change_events"])
@@ -1063,7 +1097,8 @@ class AnomalyDetectionEngine:
                     change_type=change.get("change_type", "unknown"),
                     description=change.get("description", ""),
                     severity=change.get("severity", "slight"),
-                    confidence=change.get("confidence", 0.8)
+                    confidence=change.get("confidence", 0.8),
+                    tip_contents=change.get("tip_contents"),
                 ))
         else:
             # Infer state changes from object tracking data
@@ -1659,7 +1694,11 @@ Examples:
     # for hint
     parser.add_argument('--hint_str', type=str, default='',
                         help='Hint string for the video anomaly status')
-       
+    parser.add_argument('--task_context', type=str, default='',
+                        help='Description of the intended operation and what normal looks like. '
+                             'Describes the procedure, not the expected verdict. '
+                             'Defaults to a generic industrial-manipulation context.')
+
     return parser
 
 
@@ -1735,6 +1774,7 @@ def main():
             normal_video_path=args.normal_video_path or None,
             normal_caption=args.normal_caption or None,
             hint_str=args.hint_str or None,
+            task_context=args.task_context or None,
         )
         
         # Print formatted output

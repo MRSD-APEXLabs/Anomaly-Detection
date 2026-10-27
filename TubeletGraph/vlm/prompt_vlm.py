@@ -247,6 +247,8 @@ Answer: yes or no"""),
     - TEXTURE CHANGE: Has the surface appearance changed?
     - MOVEMENT CHANGE: Has the object changed between static and moving?
     - INTERACTION FAIL: Should the objects interactively move together but fail? (gear, bearing)
+    - TIP CONTENTS: If a pipette or pipette tip is visible in the LATER frame, look inside the
+    tip itself: does it contain brown or otherwise colored liquid, or is it empty?
 
     Within each of the frame, carefully check for OBVIOUS differences in objects of same type:
     - MULTIOBJECT COMPARISON: objects of same type should have exactly same state, compare objects of 
@@ -256,7 +258,8 @@ Answer: yes or no"""),
     STATE_CHANGED: [yes/no]
     CHANGE_TYPE: [movement/deformation/material_release/surface_change/size_change/none/difference_within_same_type_objects]
     CHANGE_DESCRIPTION: [describe what changed or differences in detail]
-    CHANGE_SEVERITY: [none/slight/moderate/severe]"""),
+    CHANGE_SEVERITY: [none/slight/moderate/severe]
+    TIP_CONTENTS: [colored liquid/empty/not visible]"""),
         ]
     else:
         prompt_messages_state_change = [
@@ -273,6 +276,8 @@ Answer: yes or no"""),
     - TEXTURE CHANGE: Has the surface appearance changed?
     - MOVEMENT CHANGE: Has the object changed between static and moving?
     - INTERACTION FAIL: Should the objects interactively move together but fail? (gear, bearing)
+    - TIP CONTENTS: If a pipette or pipette tip is visible in the LATER frame, look inside the
+    tip itself: does it contain brown or otherwise colored liquid, or is it empty?
 
     Within each of the frame, carefully check for OBVIOUS differences in objects of same type:
     - MULTIOBJECT COMPARISON: objects of same type should have exactly same state, compare objects of 
@@ -282,7 +287,8 @@ Answer: yes or no"""),
     STATE_CHANGED: [yes/no]
     CHANGE_TYPE: [movement/deformation/material_release/surface_change/size_change/none/difference_within_same_type_objects]
     CHANGE_DESCRIPTION: [describe what changed or differences in detail]
-    CHANGE_SEVERITY: [none/slight/moderate/severe]"""),
+    CHANGE_SEVERITY: [none/slight/moderate/severe]
+    TIP_CONTENTS: [colored liquid/empty/not visible]"""),
         ]
     
     # Interaction detection between objects
@@ -501,6 +507,97 @@ def get_added_track_starts(pred_data, prompt_obj_idx='0'):
     return objs, prompt_obj_idx
 
 
+def dip_window_frames(predictions, obj_idx, frame_indices, dense_cfg):
+    """
+    Frames to sample densely around each time the object dips to the bottom of its
+    vertical travel and comes back up (a pipette entering and leaving a tube).
+
+    A dip is a run of frames where the mask's bottom edge is in the lowest
+    `depth_frac` part of its observed range. Around each dip's entry and exit we
+    return every `interval`-th frame from `pad_before` frames before to `pad_before`
+    (entry) or `pad_after` (exit) frames after. Objects whose bottom edge moves less
+    than `min_travel_frac` of the image height get no dense frames.
+    """
+    interval = int(dense_cfg.get('interval', 2))
+    pad_before = int(dense_cfg.get('pad_before', 4))
+    pad_after = int(dense_cfg.get('pad_after', 15))
+    depth_frac = float(dense_cfg.get('depth_frac', 0.7))
+    max_gap = int(dense_cfg.get('max_gap', 3))
+    min_travel_frac = float(dense_cfg.get('min_travel_frac', 0.05))
+
+    bottoms = {}
+    img_h = None
+    for f in frame_indices:
+        m = predictions.get(str(f), {}).get(obj_idx)
+        if m is None:
+            continue
+        bm = rle_to_bmask(m)
+        img_h = bm.shape[0]
+        rows = np.where(bm.any(axis=1))[0]
+        if len(rows):
+            bottoms[f] = int(rows.max())
+    if len(bottoms) < 2:
+        return []
+    lo, hi = min(bottoms.values()), max(bottoms.values())
+    if hi - lo < min_travel_frac * img_h:
+        return []
+
+    thresh = lo + depth_frac * (hi - lo)
+    episodes = []
+    for f in sorted(bottoms):
+        if bottoms[f] < thresh:
+            continue
+        if episodes and f - episodes[-1][1] <= max_gap:
+            episodes[-1][1] = f
+        else:
+            episodes.append([f, f])
+
+    available = set(frame_indices)
+    window = set()
+    for start, end in episodes:
+        for edge, after in ((start, pad_before), (end, pad_after)):
+            window.update(f for f in range(edge - pad_before, edge + after + 1, interval) if f in available)
+    print(f"  Dense sampling around {len(episodes)} dip(s) "
+          f"{[tuple(e) for e in episodes]}: +{len(window)} frames")
+    return sorted(window)
+
+
+TIP_CROP_NOTE = """
+
+Third image: a zoomed-in close-up of the LATER frame around the bottom of the
+highlighted object, where a pipette tip would be. Answer TIP_CONTENTS from this
+close-up. The pipette tip is the thin, translucent cone attached directly to the
+bottom of the black pipette shaft. Look at the WHOLE cone down to its point:
+brown/amber color anywhere inside it means "colored liquid"; a cone that is clear
+or white along its entire length means "empty". If the cone is not fully in view
+(only the shaft or the top of the cone is visible), answer "not visible". Judge
+only the cone itself: ignore the color of any tube, well plate, or other container
+in the close-up."""
+
+
+def tip_crop(image, mask, tip_cfg):
+    """
+    Upscaled close-up around the bottom of `mask`, centered on the mask's lowest
+    (narrowest) part, where a pipette tip would be. Mostly extends upward, since the
+    tip runs up from the mask's bottom edge, with a small margin below in case the
+    tracked mask stops short of the tip's end. Returns None for an empty mask.
+    """
+    bm = rle_to_bmask(mask) if isinstance(mask, dict) else np.asarray(mask) > 0
+    rows = np.where(bm.any(axis=1))[0]
+    if len(rows) == 0:
+        return None
+    top, bottom = int(rows.min()), int(rows.max())
+    h, w = bm.shape
+    band = bm[max(top, bottom - max(1, (bottom - top) // 10)):bottom + 1]
+    cx = int(np.median(np.where(band.any(axis=0))[0]))
+    half_w = int(float(tip_cfg.get('width_frac', 0.12)) * w / 2)
+    y0 = max(0, bottom - int(float(tip_cfg.get('above_frac', 0.30)) * h))
+    y1 = min(h, bottom + int(float(tip_cfg.get('below_frac', 0.30)) * h))
+    x0, x1 = max(0, cx - half_w), min(w, cx + half_w)
+    scale = float(tip_cfg.get('upscale', 2.0))
+    return cv2.resize(image[y0:y1, x0:x1], None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+
 def detect_state_changes(
     client,
     model_name: str,
@@ -514,6 +611,8 @@ def detect_state_changes(
     sample_interval: int = 10,
     graph=None,
     graph_obj_id: str = None,
+    dense_cfg=None,
+    tip_cfg=None,
 ) -> list:
     """
     Detect state changes in a tracked object across video frames.
@@ -534,12 +633,11 @@ def detect_state_changes(
     if len(frame_indices) < 2:
         return state_changes
 
-    # Sample frames for analysis
-    sample_frames = [frame_indices[0]]
-    for i in range(sample_interval, len(frame_indices), sample_interval):
-        sample_frames.append(frame_indices[i])
-    if frame_indices[-1] not in sample_frames:
-        sample_frames.append(frame_indices[-1])
+    # Sample frames for analysis: uniform, plus dense frames around dips if enabled
+    sample_frames = set(frame_indices[::sample_interval]) | {frame_indices[-1]}
+    if dense_cfg is not None and dense_cfg.get('enabled', False):
+        sample_frames |= set(dip_window_frames(predictions, obj_idx, frame_indices, dense_cfg))
+    sample_frames = sorted(sample_frames)
 
 
     print(f"  Analyzing {len(sample_frames)} frames for state changes...")
@@ -579,15 +677,23 @@ def detect_state_changes(
             img_before_masked = get_masked_image(img_before, mask_before, init_color)
             img_after_masked = get_masked_image(img_after, mask_after, init_color)
 
+        # Optional close-up of the later frame's tip region, from the unannotated frame
+        tip_img = None
+        if tip_cfg is not None and tip_cfg.get('enabled', False):
+            tip_img = tip_crop(img_after, mask_after, tip_cfg)
+
         # Query VLM for state change
         state_change_prompt = prompts['state_change'][0]
-        if relation_note:
-            state_change_prompt = ('text', state_change_prompt[1] + relation_note)
+        extra_note = relation_note + (TIP_CROP_NOTE if tip_img is not None else "")
+        if extra_note:
+            state_change_prompt = ('text', state_change_prompt[1] + extra_note)
         content_data = [
             state_change_prompt,
             ('image', img_before_masked),
             ('image', img_after_masked),
         ]
+        if tip_img is not None:
+            content_data.append(('image', tip_img))
         
         try:
             rsp = call_vlm(
@@ -603,7 +709,8 @@ def detect_state_changes(
             change_type = 'none'
             change_desc = ''
             severity = 'none'
-            
+            tip_contents = 'not visible'
+
             for line in rsp.split('\n'):
                 line = line.strip()
                 if line.startswith('STATE_CHANGED:'):
@@ -614,17 +721,25 @@ def detect_state_changes(
                     change_desc = line.split(':', 1)[1].strip()
                 elif line.startswith('CHANGE_SEVERITY:'):
                     severity = line.split(':', 1)[1].strip().lower()
-            
-            if state_changed:
+                elif line.startswith('TIP_CONTENTS:'):
+                    tip_contents = line.split(':', 1)[1].strip().lower()
+
+            # A visible tip's contents is the evidence the pipetting-success
+            # criterion in prompt_vad.py needs, so keep it even when the frame
+            # pair shows no other state change.
+            tip_seen = tip_contents in ('colored liquid', 'empty')
+            if state_changed or tip_seen:
                 state_changes.append({
                     'start_frame': frame_idx_before,
                     'end_frame': frame_idx_after,
-                    'change_type': change_type,
+                    'change_type': change_type if state_changed else 'tip_observation',
                     'description': change_desc,
-                    'severity': severity,
+                    'severity': severity if state_changed else 'none',
+                    'tip_contents': tip_contents,
                     'object_idx': obj_idx
                 })
-                print(f"    State change detected: frames {frame_idx_before}-{frame_idx_after}: {change_desc}")
+                print(f"    State change detected: frames {frame_idx_before}-{frame_idx_after} "
+                      f"[tip: {tip_contents}]: {change_desc}")
         
         except Exception as e:
             print(f"    Warning: VLM query failed: {e}")
@@ -876,6 +991,8 @@ if __name__ == "__main__":
                 prompts,
                 args.temp, args.sample_interval,
                 graph=video_graph, graph_obj_id=graph_obj_id,
+                dense_cfg=cfg.vlm.get('dense_sampling', None),
+                tip_cfg=cfg.vlm.get('tip_crop', None),
             )
             
             if state_changes:
