@@ -48,6 +48,11 @@ tubelet:
   fill_coverage_thrd: 0.25   # add a filling entity only if it is covered by existing entities for < 0.25
   rm_init_entity_thrd: 0.75  # remove an initializing entity if it is covered by prompt mask for > 0.75
   collect_spacing: 30
+  roi_filter:                # only track entities near the prompt objects (speeds up tubelets)
+    enabled: False
+    margin_frac: 0.1         # padding around the prompt objects, as a fraction of image size
+    vertical_extend: True    # span the full image height (tools that travel vertically)
+    min_overlap: 0.5         # entity must lie at least this much inside the region
   prox_tracker:
     name: SAM2.1
     module: SAM2
@@ -105,6 +110,20 @@ vlm:
   init_color_name: pink
   query_color_rgb: [0, 245, 245]
   query_color_name: cyan-blue
+  dense_sampling:            # Stage 2: extra VLM samples around each dip into a container
+    enabled: False
+    interval: 2              # frames between dense samples
+    pad_before: 4            # frames before each dip entry/exit
+    pad_after: 15            # frames after each exit (when tip contents become visible)
+    depth_frac: 0.7          # a dip = bottom edge in the lowest 30% of its travel
+    max_gap: 3               # merge dip frames separated by at most this many frames
+    min_travel_frac: 0.05    # objects moving less than this (of image height) get no dense frames
+  tip_crop:                  # Stage 2: add a zoomed close-up of the tip region to each VLM query
+    enabled: False
+    width_frac: 0.12         # crop width, as a fraction of image width
+    above_frac: 0.30         # extend this far above the object's bottom edge; the tip runs upward from it
+    below_frac: 0.30         # and this far below it (the tracked mask often stops at the adapter, above the tip)
+    upscale: 2.0
 
 eval:
   obj_id: '0'

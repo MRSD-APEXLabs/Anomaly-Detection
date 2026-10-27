@@ -1,0 +1,4 @@
+Task: A single-channel pipette (P300 GEN2) on an Opentron liquid-handling robot transfers brown liquid: it aspirates from a tube, then dispenses into a well plate.
+Normal sequence: the pipette tip is lowered into the tube, draws liquid up into the tip (so the tube's liquid level may drop), and moves up out of the tube. It then moves over the well plate and dispenses the liquid. The tip is empty before aspiration; that is expected.
+Expected behavior: after the pipette moves up out of the tube, the tip holds brown liquid.
+Anomaly definition for this task: ONLY a failed aspiration counts as an anomaly, i.e. the tip comes out of the tube without brown liquid in it (a clogged tip). Do not report any other anomaly type. Dispensing behavior, liquid at or below the tip near the well plate, small position shifts, and motion blur are all part of normal operation here.

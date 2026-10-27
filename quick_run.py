@@ -59,7 +59,9 @@ def get_parser():
     # NEW ARGUMENT
     parser.add_argument("--mask_frame_id", type=int, default=0, help="Frame ID for the mask input.")
     parser.add_argument("--hint_str", type=str, default="", help="Optional hint string to provide to the VLM for better predictions.")
-    
+    parser.add_argument("--gpus", type=int, nargs='+', default=[0],
+                        help="GPU IDs, forwarded to TubeletGraph/run.py (which sets CUDA_VISIBLE_DEVICES per worker)")
+
     return parser
 
 
@@ -100,6 +102,7 @@ def main():
             "--mask_frame_id", str(args.mask_frame_id),  # Added here to pass it to run.py
             "--hint_str", args.hint_str,  # Added here to pass the hint string to run.py
             "--vlm", args.vlm_model,
+            "--gpus", *[str(g) for g in args.gpus],
         ]
         
         if not run_command(cmd, "Running TubeletGraph pipeline"):
