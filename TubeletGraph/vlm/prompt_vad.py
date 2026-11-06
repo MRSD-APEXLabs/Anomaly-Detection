@@ -116,6 +116,7 @@ class DetectedAnomaly:
     end_frame: int
     confidence: float
     reasoning_trace: Dict[str, str]
+    verification: Optional[Dict] = None   # outcome of verify_anomalies_visually
 
 
 @dataclass
@@ -146,6 +147,8 @@ class AnomalyReport:
     timestamp: str
     processing_time: float
     caption: str
+    # anomalies the reasoning chain claimed but visual verification rejected
+    discarded_anomalies: List[Dict] = field(default_factory=list)
 
 
 # =============================================================================
@@ -806,14 +809,16 @@ Output your analysis as JSON:
 
 
 
-PROMPT_VISUAL_VERIFICATION = """Examine these caption and frames showing a potential anomaly. 
+PROMPT_VISUAL_VERIFICATION = """Examine these caption and frames showing a potential anomaly.
 
 Video Caption: {caption}
-
+{task_context_block}
 CLAIMED ANOMALY:
 Type: {anomaly_type}
 Description: {anomaly_description}
 Affected objects: {affected_objects}
+Evidence frames cited: {evidence_frames}
+The frames shown are the sampled frames nearest those evidence frames: {frames_shown}.
 
 INSTRUCTION:
 Based on the video caption and frames, verify if this CLAIMED ANOMALY is correct following these steps strictly:
@@ -1301,90 +1306,123 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
         anomalies: List[Dict],
         frames: List[Tuple[int, Any]],
         caption: str,
-        hint_str: Optional[str] = None
-    ) -> List[Dict]:
-        """Verify detected anomalies with visual evidence."""
+        hint_str: Optional[str] = None,
+        task_context: Optional[str] = None,
+        max_images: int = 6,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Verify detected anomalies with visual evidence.
+
+        Returns (kept, discarded). Every anomaly carries a "verification" dict
+        recording what happened, so a rejection is visible in the report
+        rather than silently dropping the anomaly.
+        """
         if not frames:
-            return anomalies
-        
-        verified = []
+            return anomalies, []
+
+        sampled_idx = [idx for idx, _ in frames]
+        kept, discarded = [], []
         for anomaly in anomalies:
+            conf = float(anomaly.get("confidence", 0.8))
 
             # Added: directly keep very confidents
-            if anomaly.get("confidence", 0.0) >= 0.8:
-                verified.append(anomaly)
-                continue
-            
-            if anomaly.get("confidence", 1.0) <= 0.2:
+            if conf >= 0.8:
+                anomaly["verification"] = {"status": "skipped", "reason": "confidence >= 0.8"}
+                kept.append(anomaly)
                 continue
 
-            evidence_frames = anomaly.get("evidence_frames", [])
-            
-            # Get frames for verification
-            frame_images = []
-            for ev_frame in evidence_frames[:3]:  # Max 3 frames
-                for idx, frame in frames:
-                    frame_images.append(frame)
+            if conf <= 0.2:
+                anomaly["verification"] = {"status": "discarded", "reason": "confidence <= 0.2"}
+                discarded.append(anomaly)
+                continue
 
-            if not frame_images:
-                # Use middle frames if no specific evidence frames
-                mid = len(frames) // 2
-                frame_images = [frames[mid][1]] if frames else []
-            
-            if frame_images:
-                # Coerce affected_objects to a list of strings for join
-                affected_objs = anomaly.get("affected_objects", [])
-                affected_objs_str = ", ".join(str(o) for o in affected_objs)
-
-                if hint_str and len(hint_str) > 0:
-                    prompt = PROMPT_VISUAL_VERIFICATION_HINT.format(
-                        anomaly_type=anomaly.get("anomaly_type", "unknown"),
-                        anomaly_description=anomaly.get("description", ""),
-                        affected_objects=affected_objs_str,
-                        caption=caption,
-                        hint_str=hint_str,
-                    )
-                else:
-                    prompt = PROMPT_VISUAL_VERIFICATION.format(
-                        anomaly_type=anomaly.get("anomaly_type", "unknown"),
-                        anomaly_description=anomaly.get("description", ""),
-                        affected_objects=affected_objs_str,
-                        caption=caption
-                    )
-                
+            # Frames for verification: the sampled frame nearest each cited
+            # evidence frame, plus the one after the last of them (for a
+            # pipette, the tip after it has left the tube).
+            evidence = []
+            for ef in anomaly.get("evidence_frames", []):
                 try:
-                    response = self.vlm_client.query(
-                        prompt=prompt,
-                        images=frame_images,
-                        system_prompt=SYSTEM_PROMPT_ANOMALY,
-                        temperature=0.0,
-                        max_tokens=1024
-                    )
-                    
-                    result = self.parse_json_response(response)
-                    
-                    if result.get("verified", True):
-                        anomaly["verified"] = True
-                        new_confidence = anomaly.get("confidence", 0.8) * result.get("confidence", 0.8)
-                        if new_confidence >= 0.3:
-                            verified.append(anomaly)
-                        else:
-                            print("verify discard!!!!")
-                    else:
-                        anomaly["verified"] = False
-                        new_confidence = anomaly.get("confidence", 0.8) * (1 - result.get("confidence", 0.8))
-                        if new_confidence >= 0.3:
-                            verified.append(anomaly)
-                        else:
-                            print("verify discard!!!!")
-                            
-                except Exception as e:
-                    logger.warning(f"Visual verification failed: {e}")
-                    verified.append(anomaly)
+                    evidence.append(int(ef))
+                except (TypeError, ValueError):
+                    pass
+            chosen = []
+            for ev in evidence[:3]:
+                pos = min(range(len(sampled_idx)), key=lambda i: abs(sampled_idx[i] - ev))
+                chosen.append(pos)
+            if chosen:
+                after = max(chosen) + 1
+                if after < len(frames):
+                    chosen.append(after)
             else:
-                verified.append(anomaly)
-       
-        return verified
+                chosen = [len(frames) // 2]   # no usable evidence frames
+            chosen = sorted(set(chosen))[:max_images]
+            frame_images = [frames[i][1] for i in chosen]
+            frames_shown = [sampled_idx[i] for i in chosen]
+
+            # Coerce affected_objects to a list of strings for join
+            affected_objs = anomaly.get("affected_objects", [])
+            affected_objs_str = ", ".join(str(o) for o in affected_objs)
+
+            if hint_str and len(hint_str) > 0:
+                prompt = PROMPT_VISUAL_VERIFICATION_HINT.format(
+                    anomaly_type=anomaly.get("anomaly_type", "unknown"),
+                    anomaly_description=anomaly.get("description", ""),
+                    affected_objects=affected_objs_str,
+                    caption=caption,
+                    hint_str=hint_str,
+                )
+            else:
+                task_context_block = ""
+                if task_context:
+                    task_context_block = (
+                        f"\nTASK CONTEXT (defines what counts as an anomaly):\n{task_context}\n"
+                        "If the claimed anomaly is that something is MISSING (e.g. no liquid in a "
+                        "pipette tip), frames that clearly show it missing are direct evidence.\n")
+                prompt = PROMPT_VISUAL_VERIFICATION.format(
+                    anomaly_type=anomaly.get("anomaly_type", "unknown"),
+                    anomaly_description=anomaly.get("description", ""),
+                    affected_objects=affected_objs_str,
+                    caption=caption,
+                    task_context_block=task_context_block,
+                    evidence_frames=evidence or "none",
+                    frames_shown=frames_shown,
+                )
+
+            try:
+                response = self.vlm_client.query(
+                    prompt=prompt,
+                    images=frame_images,
+                    system_prompt=SYSTEM_PROMPT_ANOMALY,
+                    temperature=0.0,
+                    max_tokens=1024
+                )
+                result = self.parse_json_response(response)
+            except Exception as e:
+                logger.warning(f"Visual verification failed: {e}")
+                anomaly["verification"] = {"status": "error", "error": str(e),
+                                           "frames_shown": frames_shown}
+                kept.append(anomaly)
+                continue
+
+            is_verified = bool(result.get("verified", True))
+            v_conf = float(result.get("confidence", 0.8))
+            new_confidence = conf * v_conf if is_verified else conf * (1 - v_conf)
+            keep = new_confidence >= 0.3
+            anomaly["verification"] = {
+                "status": "kept" if keep else "discarded",
+                "verified": is_verified,
+                "verifier_confidence": v_conf,
+                "adjusted_confidence": round(new_confidence, 3),
+                "frames_shown": frames_shown,
+                "revised_description": result.get("revised_description", ""),
+            }
+            anomaly["verified"] = is_verified
+            self.log(f"Verification of '{anomaly.get('anomaly_type')}': verified={is_verified} "
+                     f"(verifier conf {v_conf:.2f}, adjusted {new_confidence:.2f}) on frames "
+                     f"{frames_shown} -> {'kept' if keep else 'DISCARDED'}")
+            (kept if keep else discarded).append(anomaly)
+
+        return kept, discarded
     
     def detect_anomalies(
         self,
@@ -1451,9 +1489,11 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
         raw_anomalies = reasoning_result.get("anomalies", [])
         
         # Visual verification if requested
+        discarded_anomalies: List[Dict] = []
         if verify_visually and frames and raw_anomalies:
             self.log("Verifying anomalies with visual evidence...")
-            raw_anomalies = self.verify_anomalies_visually(raw_anomalies, frames, caption=caption)
+            raw_anomalies, discarded_anomalies = self.verify_anomalies_visually(
+                raw_anomalies, frames, caption=caption, task_context=task_context)
         
         # Convert to DetectedAnomaly objects
         anomalies = []
@@ -1480,7 +1520,8 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
                 start_frame=min(evidence_frames_int),
                 end_frame=max(evidence_frames_int),
                 confidence=float(raw.get("confidence", 0.8)),
-                reasoning_trace=reasoning_result.get("reasoning", {})
+                reasoning_trace=reasoning_result.get("reasoning", {}),
+                verification=raw.get("verification"),
             ))
 
         # Determine overall status
@@ -1491,6 +1532,8 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
             severity_order = ["none", "low", "medium", "high", "critical"]
             max_sev = max(severity_order.index(a.severity) for a in anomalies)
             overall_severity = severity_order[max_sev]
+        if not anomalies:
+            overall_severity = "none"   # the reasoning's severity described rejected anomalies
         
         # Extract identified events — always as a list of plain strings
         identified_events: List[str] = []
@@ -1503,6 +1546,12 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
         
         # Generate summary
         summary = self._coerce_to_str(reasoning_result.get("summary", ""))
+        if discarded_anomalies:
+            # The reasoning's summary was written before verification; say what changed
+            note = (f"[Visual verification rejected {len(discarded_anomalies)} claimed "
+                    f"anomaly(ies): {', '.join(str(a.get('anomaly_type')) for a in discarded_anomalies)}. "
+                    + ("No anomalies remain.]" if not anomalies else f"{len(anomalies)} remain.]"))
+            summary = f"{note} Reasoning before verification: {summary}" if summary else note
         if not summary:
             if anomalies:
                 summary = f"Detected {len(anomalies)} anomaly(ies) with overall severity: {overall_severity}."
@@ -1528,8 +1577,9 @@ Failure conditions: Unexpected deformation, material leakage, grip failures"""
             timestamp=datetime.now().isoformat(),
             processing_time=processing_time,
             caption=caption or "",
+            discarded_anomalies=discarded_anomalies,
         )
-        
+
         return report
 
 
@@ -1625,6 +1675,7 @@ def save_report_json(report: AnomalyReport, output_path: str):
         "identified_events": report.identified_events,
         "anomalous_transitions": report.anomalous_transitions,
         "summary": report.summary,
+        "discarded_anomalies": report.discarded_anomalies,
         "timestamp": report.timestamp,
         "processing_time": report.processing_time,
     }
