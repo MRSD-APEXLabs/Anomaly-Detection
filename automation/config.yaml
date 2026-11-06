@@ -1,0 +1,31 @@
+# Settings for automation/service.py (recording + analysis service).
+
+service:
+  host: 0.0.0.0          # reachable from the robot over the lab network
+  port: 8100             # 8000 is taken by the OT-2 REST wrapper
+  data_dir: ~/ovad_automation   # clips/, runs/, jobs.json live here
+
+camera:
+  # Intel RealSense L515 color stream. The L515 creates 8 video devices (IR,
+  # depth, confidence, color); color is the one offering YUYV 1920x1080. Its
+  # /dev/videoN number can change, so this is the stable path for the USB 3
+  # port it is plugged into; re-check with automation/check_camera.sh if the
+  # camera is moved to another port. It must be on USB 3: at USB 2 the L515
+  # creates no video devices at all.
+  device: /dev/v4l/by-path/pci-0000:77:00.0-usbv3-0:2:1.4-video-index0
+  input_format: yuyv422  # the L515 color stream offers YUYV only (no MJPEG)
+  video_size: 1920x1080
+  framerate: 30          # camera capture rate
+  fps: 10                # rate written to the clip (the pipeline runs at 10 fps)
+  clip_length_s: 10.5    # every clip comes out this long (like the manual recordings);
+                         # a long aspirate is trimmed at the start, never the end
+  post_roll_s: 1.5       # but always keep recording at least this long after stop,
+                         # so the clip ends on the lifted tip
+  max_duration_s: 120    # safety cap if a stop never arrives
+
+pipeline:                # options passed to automation/runner.py
+  vlm: openai
+  gpu: auto              # or a GPU index
+  min_free_mib: 12000
+  gpu_wait_s: 600
+  keep_intermediates: false
