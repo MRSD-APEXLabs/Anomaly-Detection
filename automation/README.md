@@ -94,6 +94,19 @@ longer when other jobs share the GPU. The verdict is not available within the
 aspirate step itself; the tree should poll `/result/latest` or check it at
 the end of the protocol.
 
+## Autolab UI
+
+Every response carries `Access-Control-Allow-Origin: *` (and `OPTIONS` answers
+the CORS preflight), so the Autolab GCS web UI calls the service directly:
+
+- `lab_machine_executive` publishes `{"clip_id", "step"}` on
+  `/robot_1/behavior/anomaly_recording` after each successful `/recording/start`.
+- `routine_executor` attaches those clip_ids to the running routine and reports
+  them as `recordings` in `/routine_executor/status`.
+- The production screen shows a "Clog check" card with one row per clip, polling
+  `GET /result/<clip_id>`. The debug console's "Clog Detection" panel can start,
+  stop or abort a live clip, replay a typed video path, and list `GET /jobs`.
+
 ## Testing without the camera
 
 Pass an existing video as `replay_file` to replay it through the full
