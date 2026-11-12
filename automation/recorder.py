@@ -51,7 +51,13 @@ class Recorder:
     # -- status ---------------------------------------------------------------
 
     def camera_present(self) -> bool:
-        return osp.exists(self.cfg["device"])
+        # Only Linux (v4l2) devices are files; on Windows and Mac a missing
+        # camera shows up as ffmpeg failing at start.
+        if self.cfg.get("input", "v4l2") != "v4l2":
+            return True
+        # Readable, not just present: on a desktop, Linux grants camera access
+        # only to the user whose session is in front on the screen
+        return os.access(self.cfg["device"], os.R_OK | os.W_OK)
 
     @property
     def active_clip(self) -> Optional[str]:
@@ -74,7 +80,8 @@ class Recorder:
                 self._replay = replay_file
             else:
                 if not self.camera_present():
-                    raise RecorderError(f"camera not found at {self.cfg['device']}")
+                    raise RecorderError(f"camera not found or not accessible at {self.cfg['device']} "
+                                        "(unplugged, or another user's session is on the screen)")
                 self._proc = subprocess.Popen(
                     self._ffmpeg_cmd(path + ".raw.mp4"), stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL, stderr=open(path + ".ffmpeg.log", "w"))
@@ -88,10 +95,13 @@ class Recorder:
             return {"record_started": _iso(self._started)}
 
     def stop(self, clip_id: Optional[str] = None,
-             on_done: Callable[[Optional[str], Dict], None] = lambda path, info: None) -> Dict:
+             on_done: Callable[[Optional[str], Dict], None] = lambda path, info: None,
+             min_tail_s: float = 0.0) -> Dict:
         """
         Stop the active recording. Returns at once; the clip is finished in the
         background and on_done(path, info) is called with path None on failure.
+        min_tail_s: keep recording at least this long after the stop (e.g. while
+        the robot holds the lifted tip in view).
         """
         with self._lock:
             if self._clip_id is None:
@@ -104,7 +114,7 @@ class Recorder:
 
         stop_at = time.time()
         target = float(self.cfg.get("clip_length_s", 10.5))
-        tail = 0.0 if replay else max(float(self.cfg.get("post_roll_s", 1.5)),
+        tail = 0.0 if replay else max(float(self.cfg.get("post_roll_s", 1.5)), float(min_tail_s or 0),
                                       target - (stop_at - started))
         info = {"record_started": _iso(started), "stop_requested": _iso(stop_at),
                 "tail_s": round(tail, 2)}
@@ -180,10 +190,15 @@ class Recorder:
 
     def _ffmpeg_cmd(self, path: str):
         c = self.cfg
+        # v4l2 (Linux), dshow (Windows, device "video=<name>") or
+        # avfoundation (Mac, device "<index>:none")
+        inp = c.get("input", "v4l2")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-               "-f", "v4l2", "-thread_queue_size", "512"]
+               "-f", inp, "-thread_queue_size", "512"]
+        if inp == "dshow":
+            cmd += ["-rtbufsize", "256M"]
         if c.get("input_format"):
-            cmd += ["-input_format", c["input_format"]]
+            cmd += ["-input_format" if inp == "v4l2" else "-pixel_format", c["input_format"]]
         if c.get("video_size"):
             cmd += ["-video_size", c["video_size"]]
         if c.get("framerate"):

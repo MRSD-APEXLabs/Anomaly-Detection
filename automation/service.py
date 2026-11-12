@@ -16,6 +16,10 @@ Other endpoints:
     POST /analyze   {"video_path": ...}  analyze an existing video file
     GET  /health                         camera, queue and current job
     GET  /jobs                           the 50 most recent jobs
+    POST /upload/<clip_id>               the laptop agent sends a finished clip
+
+The camera can be on this computer or on a laptop running laptop_agent.py
+(set camera.remote in config.yaml); the API is the same either way.
 
 Testing without a camera: pass "replay_file": "<path to video>" to
 /recording/start; stop then uses that file as the recorded clip.
@@ -43,6 +47,7 @@ import yaml
 
 sys.path.insert(0, osp.dirname(osp.abspath(__file__)))
 from recorder import Recorder, RecorderError  # noqa: E402
+from remote_recorder import RemoteRecorder  # noqa: E402
 from runner import run_pipeline  # noqa: E402
 
 
@@ -90,7 +95,8 @@ class AnomalyService:
         for sub in ("clips", "runs"):
             os.makedirs(osp.join(self.data_dir, sub), exist_ok=True)
         self.store = JobStore(osp.join(self.data_dir, "jobs.json"))
-        self.recorder = Recorder(cfg["camera"], log=log)
+        self.remote = bool(cfg["camera"].get("remote"))
+        self.recorder = (RemoteRecorder if self.remote else Recorder)(cfg["camera"], log=log)
         self.queue: "queue.Queue[str]" = queue.Queue()
         self.current = None
 
@@ -122,8 +128,12 @@ class AnomalyService:
     def stop_recording(self, body: dict) -> dict:
         cid = self.recorder.active_clip
         analyze = body.get("analyze", True)
+        # on_done can run before stop() returns (a replay, or a fast laptop);
+        # it waits until the job is marked "finishing" so it isn't overwritten
+        marked = threading.Event()
 
         def on_done(path, info):
+            marked.wait(timeout=10)
             if path is None:
                 self.store.put(cid, status="error", anomaly_detected=None, recording=info,
                                error=f"recording failed: {info.get('error')}", failed_stage="recording")
@@ -134,9 +144,45 @@ class AnomalyService:
             else:
                 self.store.put(cid, status="recorded", recording=info)
 
+        # The robot waits for this reply before its next move, so holding the
+        # reply keeps the lifted tip above the tube, in view; the recording
+        # runs a second past the hold.
+        hold = float(self.cfg["camera"].get("hold_after_stop_s", 0) or 0)
+
         # Returns at once; the clip's tail is recorded in the background
-        info = self.recorder.stop(body.get("clip_id"), on_done=on_done)
-        return self.store.put(cid, status="finishing", recording=info)
+        try:
+            info = self.recorder.stop(body.get("clip_id"), on_done=on_done,
+                                      min_tail_s=hold + 1.0 if hold else 0.0)
+        except RecorderError as e:
+            # The recording ended but couldn't be finished (laptop unreachable)
+            if cid and self.recorder.active_clip is None:
+                self.store.put(cid, status="error", anomaly_detected=None,
+                               error=str(e), failed_stage="recording")
+            raise
+        try:
+            job = self.store.put(cid, status="finishing", recording=info)
+        finally:
+            marked.set()
+        if hold:
+            time.sleep(hold)
+            job = self.store.get(cid) or job
+        return job
+
+    def receive_upload(self, cid: str, headers, stream) -> dict:
+        if not self.remote:
+            raise ValueError("uploads are only accepted when camera.remote is set")
+        if (headers.get("Content-Type") or "").startswith("application/json"):
+            n = int(headers.get("Content-Length") or 0)
+            body = json.loads(stream.read(n) or b"{}")
+            return self.recorder.fail(cid, str(body.get("error", "unknown error")))
+        length = int(headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("empty upload")
+        try:
+            agent_info = json.loads(headers.get("X-Recording-Info") or "{}")
+        except json.JSONDecodeError:
+            agent_info = {}
+        return self.recorder.deliver(cid, stream, length, agent_info)
 
     def abort_recording(self) -> dict:
         cid = self.recorder.active_clip
@@ -155,9 +201,15 @@ class AnomalyService:
         return job
 
     def health(self) -> dict:
-        return {"ok": True, "camera_present": self.recorder.camera_present(),
-                "camera_device": self.cfg["camera"]["device"],
-                "recording": self.recorder.active_clip,
+        if self.remote:
+            agent = self.recorder.agent_health()
+            camera = {"camera_present": bool(agent and agent.get("camera_present")),
+                      "camera_device": (agent or {}).get("camera_device"),
+                      "camera_remote": self.recorder.url, "laptop_agent_reachable": agent is not None}
+        else:
+            camera = {"camera_present": self.recorder.camera_present(),
+                      "camera_device": self.cfg["camera"]["device"]}
+        return {"ok": True, **camera, "recording": self.recorder.active_clip,
                 "running": self.current, "queued": self.queue.qsize()}
 
     # -- worker ---------------------------------------------------------------
@@ -229,6 +281,17 @@ def make_handler(svc: AnomalyService):
             self._send(404, {"error": f"no route GET {self.path}"})
 
         def do_POST(self):
+            m = re.fullmatch(r"/upload/([A-Za-z0-9_]+)", self.path)
+            if m:
+                try:
+                    return self._send(200, svc.receive_upload(m.group(1), self.headers, self.rfile))
+                except RecorderError as e:
+                    return self._send(409, {"error": str(e)})
+                except (ValueError, json.JSONDecodeError) as e:
+                    return self._send(400, {"error": str(e)})
+                except Exception as e:
+                    log(f"error on upload {m.group(1)}: {type(e).__name__}: {e}")
+                    return self._send(500, {"error": f"{type(e).__name__}: {e}"})
             routes = {
                 "/recording/start": lambda b: svc.start_recording(b),
                 "/recording/stop": lambda b: svc.stop_recording(b),
@@ -268,8 +331,9 @@ def main():
     svc = AnomalyService(cfg)
     host, port = cfg["service"]["host"], cfg["service"]["port"]
     server = ThreadingHTTPServer((host, port), make_handler(svc))
+    where = f"laptop agent {cfg['camera']['remote']}" if svc.remote else cfg["camera"]["device"]
     log(f"listening on {host}:{port}; data in {svc.data_dir}; "
-        f"camera {'found' if svc.recorder.camera_present() else 'NOT found'} at {cfg['camera']['device']}")
+        f"camera {'found' if svc.recorder.camera_present() else 'NOT found'} at {where}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

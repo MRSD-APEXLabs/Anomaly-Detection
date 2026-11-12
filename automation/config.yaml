@@ -12,7 +12,7 @@ camera:
   # port it is plugged into; re-check with automation/check_camera.sh if the
   # camera is moved to another port. It must be on USB 3: at USB 2 the L515
   # creates no video devices at all.
-  device: /dev/v4l/by-path/pci-0000:77:00.0-usbv3-0:2:1.4-video-index0
+  device: /dev/v4l/by-path/pci-0000:79:00.4-usbv3-0:2:1.4-video-index0
   input_format: yuyv422  # the L515 color stream offers YUYV only (no MJPEG)
   video_size: 1920x1080
   framerate: 30          # camera capture rate
@@ -22,6 +22,17 @@ camera:
   post_roll_s: 1.5       # but always keep recording at least this long after stop,
                          # so the clip ends on the lifted tip
   max_duration_s: 120    # safety cap if a stop never arrives
+  hold_after_stop_s: 3   # the stop call replies only after this long, so the robot
+                         # holds the lifted tip in view before its next move (the
+                         # behavior tree waits for the reply); 0 = reply at once
+
+  # Camera on a laptop instead: run automation/laptop_agent.py there and set
+  # this to its address, e.g. http://<laptop-ip>:8101. The laptop records and
+  # uploads each clip here; the device and format settings above are then
+  # unused (the agent has its own flags), but hold_after_stop_s still applies.
+  # Leave empty to use the camera on this computer.
+  remote: "http://192.168.10.6:8101"
+  remote_upload_timeout_s: 120   # give up on a clip if the laptop hasn't sent it by then
 
 pipeline:                # options passed to automation/runner.py
   vlm: openai

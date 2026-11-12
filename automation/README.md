@@ -22,6 +22,8 @@ lab_machine_executive (robot)              GPU desktop (gcs.autolab)
 |---|---|
 | `service.py` | HTTP API, job queue, and job records |
 | `recorder.py` | Camera recording with ffmpeg |
+| `remote_recorder.py` | Recording with a camera on a laptop (see below) |
+| `laptop_agent.py` | Runs on that laptop: records and uploads clips |
 | `runner.py` | Runs Stage 1 -> 2 -> 3 on one video. Also usable on its own. |
 | `config.yaml` | Port, camera, data folder, and pipeline options |
 | `start_service.sh` | Activates the `ovad` env and starts the service |
@@ -118,6 +120,35 @@ curl -X POST localhost:8100/recording/stop
 curl localhost:8100/result/latest
 ```
 
+## Camera on a laptop
+
+The camera can be plugged into a laptop next to the OT-2 instead of the
+desktop. The behavior tree and the UI still talk only to the desktop; the
+desktop forwards start/stop to the laptop, and the laptop uploads each
+finished clip back.
+
+```
+service.py (desktop :8100) ── /start, /stop, /abort ──> laptop_agent.py (laptop :8101) ── ffmpeg ── camera
+service.py                 <── POST /upload/<clip_id> ── laptop_agent.py
+```
+
+On the laptop (needs only Python 3 and ffmpeg, no GPU or conda env), from
+the `automation/` folder:
+
+```bash
+python laptop_agent.py --list-devices                     # find the camera
+python laptop_agent.py --device /dev/video6                # Linux (the YUYV 1920x1080 device)
+python laptop_agent.py --device "video=<camera name>"      # Windows
+```
+
+`--desktop` defaults to `http://gcs.autolab:8100`. Clips are also kept on the
+laptop in `~/ovad_laptop/clips/`.
+
+On the desktop, set `camera.remote: http://<laptop-ip>:8101` in `config.yaml`
+and restart the service. `/health` then reports `laptop_agent_reachable` and
+the laptop's camera. If the laptop can't be reached at stop, or its upload
+never arrives within `remote_upload_timeout_s`, the job ends as `error`.
+
 ## Executive integration (`lab_machine_executive.cpp`)
 
 Wrap the aspirate step in `dispatch_ot2_step`, which already runs off the main
@@ -163,3 +194,6 @@ waits up to about 9 s for the camera, which is within `http_post`'s 30 s timeout
   `ffmpeg -f v4l2 -list_formats all -i /dev/video0`.
 - Only one program can use the camera at a time. Close OBS or any preview
   before starting the service.
+- On a shared Linux desktop, only the user whose session is on the screen can
+  open the camera. If someone else logs in at the screen, or it returns to the
+  login screen, `/health` shows `camera_present: false`.
